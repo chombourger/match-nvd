@@ -1,0 +1,26 @@
+{
+  "bash": [
+    {
+       "version" : "4.3",
+       "patches" : [
+         "CVE-2016-7543"
+       ]
+    },
+    {
+       "version": "4.4"
+    }
+  ],
+  "linux-image-4.9.0-6-amd64": [
+    {
+       "version": "4.9.88"
+    }
+  ],
+  "openssl": [
+    {
+       "version": "1.0.2l"
+    },
+    {
+       "version": "1.1.0f"
+    }
+  ]
+}
