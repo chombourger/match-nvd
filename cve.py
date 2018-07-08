@@ -12,8 +12,18 @@ import os
 import json
 import re
 
-aliases  = {}
-packages = {}
+aliases        = {}
+distribution   = {}
+distro_name    = None
+distro_version = None
+do_debug       = False
+packages       = {}
+
+# -------------------------------------------------------------------------------------------------
+def debug(x):
+# -------------------------------------------------------------------------------------------------
+    if do_debug == True:
+        print(x)
 
 # -------------------------------------------------------------------------------------------------
 def load_nvd(nvd_file):
@@ -34,6 +44,16 @@ def load_aliases(aliases_file):
     return aliases_data
 
 # -------------------------------------------------------------------------------------------------
+def load_distribution(distro_file):
+# -------------------------------------------------------------------------------------------------
+    if os.path.exists(distro_file) == False:
+        return {}
+    distro_data = None
+    with open(distro_file) as data:
+       distro_data = json.load(data)
+    return distro_data
+
+# -------------------------------------------------------------------------------------------------
 def load_packages(pkg_file):
 # -------------------------------------------------------------------------------------------------
     pkg_data = None
@@ -50,9 +70,16 @@ def match_cve_by_product(cve):
         vendor  = cve['affects']['vendor']['vendor_data'][0]
         product = vendor['product']['product_data'][0]
         name    = product['product_name']
-        if name not in packages:
-            return None
-        return name
+
+        # product matches our distribution?
+        if distro_name is not None and name == distro_name:
+            return [ distribution ]
+        # product matches an installed package?
+        if name in packages:
+            return [ app for app in packages[name] ]
+        # none of the above
+        return None
+
     except (KeyError, IndexError):
         return None
 
@@ -105,7 +132,8 @@ def match_application(my_app, my_ver, product, vendor, version, update, edition,
 def match_os(my_app, my_ver, product, vendor, version, update, edition, lang):
 # -------------------------------------------------------------------------------------------------
     if my_app != "linux_kernel":
-        return False
+        if distro_name is None or product != distro_name:
+            return False
     return match_version(my_ver, version)
 
 # -------------------------------------------------------------------------------------------------
@@ -149,17 +177,17 @@ def evaluate_cpe22(my_app, my_ver, uri):
 def evaluate_cpe(my_app, my_ver, cpe):
 # -------------------------------------------------------------------------------------------------
     if 'versionStartExcluding' in cpe:
-        test_ver = cpe['versionEndIncluding']
+        test_ver = cpe['versionStartExcluding']
         cmp = apt_pkg.version_compare(my_ver, test_ver)
         if cmp <= 0:
             return False
     if 'versionStartIncluding' in cpe:
-        test_ver = cpe['versionEndIncluding']
+        test_ver = cpe['versionStartIncluding']
         cmp = apt_pkg.version_compare(my_ver, test_ver)
         if cmp < 0:
             return False
     if 'versionEndExcluding' in cpe:
-        test_ver = cpe['versionEndIncluding']
+        test_ver = cpe['versionEndExcluding']
         cmp = apt_pkg.version_compare(my_ver, test_ver)
         if cmp >= 0:
             return False
@@ -198,8 +226,10 @@ def evaluate_node(my_app, my_ver, node):
 # -------------------------------------------------------------------------------------------------
     result = False
     if 'cpe' in node:
+        debug('evaluate cpe')
         result = evaluate_cpes(my_app, my_ver, node['cpe'])
     elif 'children' in node:
+        debug('evaluate children')
         result = evaluate_children(my_app, my_ver, node['children'])
     return result
 
@@ -225,10 +255,13 @@ def match_configurations(my_app, my_ver, cve):
 # -------------------------------------------------------------------------------------------------
     try:
         configurations = cve['configurations']
+        debug("%d configurations" % (len(configurations)))
         for node in configurations['nodes']:
-            op = node['operator']
+            op      = node['operator']
             results = evaluate_node(my_app, my_ver, node)
-            return evaluate_results(op, results)
+            debug("OP=%s, %d results: %s" % (op, len(results), results))
+            if evaluate_results(op, results) == False:
+                return False
         return True
     except KeyError:
         return False
@@ -239,14 +272,24 @@ def match_configurations(my_app, my_ver, cve):
 
 apt_pkg.init_system()
 
-aliases  = load_aliases('aliases.json')
-packages = load_packages('packages.json')
+aliases      = load_aliases('aliases.json')
+distribution = load_aliases('distribution.json')
+packages     = load_packages('packages.json')
+
+if 'name' in distribution:
+    distro_name = distribution['name']
+if 'version' in distribution:
+    distro_version = distribution['version']
 
 for name in aliases:
     if name in packages:
         pkg = packages[name]
         alias = aliases[name]
         packages[alias] = pkg
+
+for name in packages:
+    for app in packages[name]:
+        app['name'] = name
 
 nvd_files = glob.glob('nvdcve-*.json')
 for nvd_file in nvd_files:
@@ -255,12 +298,16 @@ for nvd_file in nvd_files:
         if 'cve' not in entry:
             continue
         cve  = entry['cve']
-        name = match_cve_by_product(cve)
-        if name is None:
+        matches = match_cve_by_product(cve)
+        if matches is None:
             continue
-        for app in packages[name]:
-            result = match_configurations(name, app['version'], entry)
-            id = cve['CVE_data_meta']['ID']
+        id = cve['CVE_data_meta']['ID']
+        for app in matches:
+            name   = app['name']
+            alias  = name
+            if name in aliases:
+                alias = aliases[name]
+            result = match_configurations(alias, app['version'], entry)
             status = 'Not affected'
             if result == True:
                 status = 'Affected'
@@ -268,4 +315,4 @@ for nvd_file in nvd_files:
                     patches = app['patches']
                     if id in patches:
                         status = 'Patched'
-            print("| %-18s | %-18s | %-8s | %-20s |" % (id, name, app['version'], status))
+            print("| %-16s | %-32s | %-8s | %-20s |" % (id, name, app['version'], status))
