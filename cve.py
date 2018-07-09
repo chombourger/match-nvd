@@ -17,6 +17,7 @@ distribution   = {}
 distro_name    = None
 distro_version = None
 do_debug       = False
+matched_rules  = []
 packages       = {}
 
 # -------------------------------------------------------------------------------------------------
@@ -24,6 +25,21 @@ def debug(x):
 # -------------------------------------------------------------------------------------------------
     if do_debug == True:
         print(x)
+
+# -------------------------------------------------------------------------------------------------
+def clear_matched_rules():
+# -------------------------------------------------------------------------------------------------
+    matched_rules.clear()
+
+# -------------------------------------------------------------------------------------------------
+def add_matched_rule(r):
+# -------------------------------------------------------------------------------------------------
+    matched_rules.append(r)
+
+# -------------------------------------------------------------------------------------------------
+def get_matched_rules():
+# -------------------------------------------------------------------------------------------------
+    return matched_rules
 
 # -------------------------------------------------------------------------------------------------
 def load_nvd(nvd_file):
@@ -67,20 +83,31 @@ def load_packages(pkg_file):
 def match_cve_by_product(cve):
 # -------------------------------------------------------------------------------------------------
     try:
-        vendor  = cve['affects']['vendor']['vendor_data'][0]
-        product = vendor['product']['product_data'][0]
-        name    = product['product_name']
+        matched_distro = None
+        matched_pkgs   = []
+        for vendor in cve['affects']['vendor']['vendor_data']:
+            for product in vendor['product']['product_data']:
+                name = product['product_name']
+                # product matches an installed package?
+                if name in packages:
+                    debug('%s is an installed package' % (name))
+                    for pkg in packages[name]:
+                        debug(pkg)
+                        matched_pkgs.append(pkg)
+                # product matches our distribution?
+                if distro_name is not None and name == distro_name:
+                    debug('%s is our distribution' % (name))
+                    matched_distro = distribution
 
-        # product matches our distribution?
-        if distro_name is not None and name == distro_name:
-            return [ distribution ]
-        # product matches an installed package?
-        if name in packages:
-            return [ app for app in packages[name] ]
+        if len(matched_pkgs) > 0:
+            return matched_pkgs
+        if matched_distro is not None:
+            return [ matched_distro ]
+
         # none of the above
         return None
 
-    except (KeyError, IndexError):
+    except KeyError:
         return None
 
 # -------------------------------------------------------------------------------------------------
@@ -113,7 +140,9 @@ def match_version(my_ver, test_ver):
 # -------------------------------------------------------------------------------------------------
 def match_application(my_app, my_ver, product, vendor, version, update, edition, lang):
 # -------------------------------------------------------------------------------------------------
-    if my_app != product:
+    debug("app check criteria: '%s' version '%s' against: '%s' version '%s'" %
+          (product, version, my_app, my_ver))
+    if update != '*':
         return False
     return match_version(my_ver, version)
 
@@ -134,11 +163,74 @@ def match_os(my_app, my_ver, product, vendor, version, update, edition, lang):
     if my_app != "linux_kernel":
         if distro_name is None or product != distro_name:
             return False
+        elif distro_version is not None:
+            my_ver = distro_version
     return match_version(my_ver, version)
 
 # -------------------------------------------------------------------------------------------------
-def evaluate_cpe23(my_app, my_ver, uri):
+def evaluate_versions(my_app, my_ver, part, product, cpe):
 # -------------------------------------------------------------------------------------------------
+    versions = []
+    if my_app != product:
+        debug('top-level product: %s, cpe for %s' % (my_app, product))
+        if part == 'a':
+            if product in packages:
+                for app in packages[product]:
+                    versions.append(app['version'])
+                my_app = product
+            else:
+                debug('%s not installed' % (product))
+                return False
+        elif part == 'o':
+            if distro_name is not None and product == distro_name:
+                my_app = distro_name
+                if distro_version is not None:
+                    versions.append(distro_version)
+                else:
+                    debug('%s version not specified!' % (distro_name))
+                    return False
+            else:
+                debug("our distribution isn't %s" % (product))
+                return False
+        else:
+            debug("unsupported part '%s'!" % (part))
+            return False
+    else:
+        versions.append(my_ver)
+    debug("%s versions to check: %s" % (my_app, str(versions)))
+
+    version_checks = []
+    if 'versionStartExcluding' in cpe:
+        test_ver = cpe['versionStartExcluding']
+        cmp = apt_pkg.version_compare(my_ver, test_ver)
+        if cmp <= 0:
+            return False
+        version_checks.append('version > %s' % test_ver)
+    if 'versionStartIncluding' in cpe:
+        test_ver = cpe['versionStartIncluding']
+        cmp = apt_pkg.version_compare(my_ver, test_ver)
+        if cmp < 0:
+            return False
+        version_checks.append('version >= %s' % test_ver)
+    if 'versionEndExcluding' in cpe:
+        test_ver = cpe['versionEndExcluding']
+        cmp = apt_pkg.version_compare(my_ver, test_ver)
+        if cmp >= 0:
+            return False
+        version_checks.append('version < %s' % test_ver)
+    if 'versionEndIncluding' in cpe:
+        test_ver = cpe['versionEndIncluding']
+        cmp = apt_pkg.version_compare(my_ver, test_ver)
+        if cmp > 0:
+            return False
+        version_checks.append('version <= %s' % test_ver)
+    if len(version_checks) > 0:
+        add_matched_rule(product + ': ' + ' && '.join(version_checks))
+
+# -------------------------------------------------------------------------------------------------
+def evaluate_cpe23(my_app, my_ver, cpe):
+# -------------------------------------------------------------------------------------------------
+    uri     = cpe['cpe23Uri']
     values  = uri.split(':')
     scheme  = values[0]
     proto   = values[1]
@@ -149,57 +241,54 @@ def evaluate_cpe23(my_app, my_ver, uri):
     update  = values[6]
     edition = values[7]
     lang    = values[8]
+
+    result = evaluate_versions(my_app, my_ver, part, product, cpe)
+    if result == False:
+        return False
+
     if part == 'a':
-        return match_application(my_app, my_ver, product, vendor, version, update, edition, lang)
+        result = match_application(my_app, my_ver, product, vendor, version, update, edition, lang)
     elif part == 'o':
-        return match_os(my_app, my_ver, product, vendor, version, update, edition, lang)
-    return False
+        result = match_os(my_app, my_ver, product, vendor, version, update, edition, lang)
+
+    if result == True:
+        add_matched_rule(uri)
+    return result
 
 # -------------------------------------------------------------------------------------------------
-def evaluate_cpe22(my_app, my_ver, uri):
+def evaluate_cpe22(my_app, my_ver, cpe):
 # -------------------------------------------------------------------------------------------------
+    uri     = cpe['cpe22Uri']
     values  = uri.split(':')
     scheme  = values[0]
-    part    = values[1]
+    part    = values[1].replace('/', '')
     vendor  = values[2]
     product = values[3]
     version = values[4]
     update  = values[5]
     edition = values[6]
     lang    = values[7]
-    if part == '/a':
-        return match_application(my_app, my_ver, product, vendor, version, update, edition, lang)
-    elif part == '/o':
-        return match_os(product, vendor, vendor, version, update, edition, lang)
-    return False
+
+    result = evaluate_versions(my_app, my_ver, part, product, cpe)
+    if result == False:
+        return False
+
+    if part == 'a':
+        result = match_application(my_app, my_ver, product, vendor, version, update, edition, lang)
+    elif part == 'o':
+        result = match_os(product, vendor, vendor, version, update, edition, lang)
+
+    if result == True:
+        add_matched_rule(uri)
+    return result
 
 # -------------------------------------------------------------------------------------------------
 def evaluate_cpe(my_app, my_ver, cpe):
 # -------------------------------------------------------------------------------------------------
-    if 'versionStartExcluding' in cpe:
-        test_ver = cpe['versionStartExcluding']
-        cmp = apt_pkg.version_compare(my_ver, test_ver)
-        if cmp <= 0:
-            return False
-    if 'versionStartIncluding' in cpe:
-        test_ver = cpe['versionStartIncluding']
-        cmp = apt_pkg.version_compare(my_ver, test_ver)
-        if cmp < 0:
-            return False
-    if 'versionEndExcluding' in cpe:
-        test_ver = cpe['versionEndExcluding']
-        cmp = apt_pkg.version_compare(my_ver, test_ver)
-        if cmp >= 0:
-            return False
-    if 'versionEndIncluding' in cpe:
-        test_ver = cpe['versionEndIncluding']
-        cmp = apt_pkg.version_compare(my_ver, test_ver)
-        if cmp > 0:
-            return False
     if 'cpe23Uri' in cpe:
-        return evaluate_cpe23(my_app, my_ver, cpe['cpe23Uri'])
+        return evaluate_cpe23(my_app, my_ver, cpe)
     elif 'cpe22Uri' in cpe:
-        return evaluate_cpe22(my_app, my_ver, cpe['cpe22Uri'])
+        return evaluate_cpe22(my_app, my_ver, cpe)
     else:
         return False
 
@@ -226,7 +315,7 @@ def evaluate_node(my_app, my_ver, node):
 # -------------------------------------------------------------------------------------------------
     result = False
     if 'cpe' in node:
-        debug('evaluate cpe')
+        debug('evaluate cpe against %s version %s' % (my_app, my_ver))
         result = evaluate_cpes(my_app, my_ver, node['cpe'])
     elif 'children' in node:
         debug('evaluate children')
@@ -255,16 +344,29 @@ def match_configurations(my_app, my_ver, cve):
 # -------------------------------------------------------------------------------------------------
     try:
         configurations = cve['configurations']
-        debug("%d configurations" % (len(configurations)))
+        debug("%d configurations" % (len(configurations['nodes'])))
         for node in configurations['nodes']:
             op      = node['operator']
             results = evaluate_node(my_app, my_ver, node)
             debug("OP=%s, %d results: %s" % (op, len(results), results))
-            if evaluate_results(op, results) == False:
-                return False
-        return True
+            if evaluate_results(op, results) == True:
+                return True
+        return False
     except KeyError:
         return False
+
+# -------------------------------------------------------------------------------------------------
+def print_matches(id, product, version, status):
+# -------------------------------------------------------------------------------------------------
+    matches = get_matched_rules()
+    if len(matches) == 0:
+        matches.append('')
+    for m in matches:
+        print("| %-16s | %-32s | %-8s | %-20s | %-56s |" % (id, product, version, status, m))
+        id      = ''
+        product = ''
+        version = ''
+        status  = ''
 
 # -------------------------------------------------------------------------------------------------
 # Our main
@@ -298,11 +400,12 @@ for nvd_file in nvd_files:
         if 'cve' not in entry:
             continue
         cve  = entry['cve']
+        id = cve['CVE_data_meta']['ID']
         matches = match_cve_by_product(cve)
         if matches is None:
             continue
-        id = cve['CVE_data_meta']['ID']
         for app in matches:
+            clear_matched_rules()
             name   = app['name']
             alias  = name
             if name in aliases:
@@ -315,4 +418,6 @@ for nvd_file in nvd_files:
                     patches = app['patches']
                     if id in patches:
                         status = 'Patched'
-            print("| %-16s | %-32s | %-8s | %-20s |" % (id, name, app['version'], status))
+            else:
+                clear_matched_rules()
+            print_matches(id, name, app['version'], status)
